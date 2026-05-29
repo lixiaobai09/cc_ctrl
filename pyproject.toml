@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cctl"
+version = "0.1.0"
+description = "Stash and resume Claude Code sessions with tmux integration"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+[project.scripts]
+cctl = "cctl.cli:main"
+cct = "cctl.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cctl"]
