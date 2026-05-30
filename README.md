@@ -38,11 +38,13 @@ It installs completion for both `cctl` and `cct`.
 
 ### `cctl create <name> [comment...]`
 
-Creates a new tmux session named `<name>` in the current directory, launches `claude` inside it, and switches you to it. Errors if either a `cctl` workspace or a raw tmux session of that name already exists.
+Creates a new tmux session named `<name>` in the current directory, then launches `claude` inside the session's shell, and switches you to it. Errors if either a `cctl` workspace or a raw tmux session of that name already exists.
 
 ```bash
 cctl create auth-refactor "split middleware per legal feedback"
 ```
+
+The session is started as a normal interactive shell with `claude` sent as a typed command on top — so when you `/quit` claude (or whatever you ran), you drop back to a live shell prompt instead of the tmux session dying. The session also has `TZ=Asia/Singapore` injected by default (configurable via `CCTL_TZ`).
 
 Options:
 
@@ -125,9 +127,10 @@ Override the directory with `CCTL_HOME=/somewhere`.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `CCTL_HOME`          | `~/.cctl`     | State directory. |
-| `CCTL_DEFAULT_CMD`   | `claude`      | Command auto-launched by `cctl create`. |
-| `CCTL_NO_SWITCH`     | (unset)       | Skip the tmux switch/attach step after `create`/`go`. Useful for scripting and tests. |
+| `CCTL_HOME`          | `~/.cctl`         | State directory. |
+| `CCTL_DEFAULT_CMD`   | `claude`          | Command auto-launched by `cctl create`. |
+| `CCTL_TZ`            | `Asia/Singapore`  | `TZ` env var injected into the new tmux session. Set to empty to skip. |
+| `CCTL_NO_SWITCH`     | (unset)           | Skip the tmux switch/attach step after `create`/`go`. Useful for scripting and tests. |
 
 ## Caveats
 

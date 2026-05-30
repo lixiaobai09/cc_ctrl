@@ -20,6 +20,7 @@ CCTL_DIR = Path(os.environ.get("CCTL_HOME", Path.home() / ".cctl"))
 STORE_FILE = CCTL_DIR / "workspaces.json"
 HISTORY_FILE = CCTL_DIR / "history.json"
 DEFAULT_CMD = os.environ.get("CCTL_DEFAULT_CMD", "claude")
+DEFAULT_TZ = os.environ.get("CCTL_TZ", "Asia/Singapore")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -189,13 +190,19 @@ def create(name: str, comment: tuple[str, ...], cmd_override: str | None, cwd_ov
     cwd = str(Path(cwd_override).resolve()) if cwd_override else os.getcwd()
     cmd = DEFAULT_CMD if cmd_override is None else cmd_override
 
+    # Start a bare shell, not the command itself. That way `/quit` (or whatever
+    # exits cmd) leaves the user at a live shell prompt instead of tearing the
+    # tmux session down with cmd's exit.
     new_args = ["new-session", "-d", "-s", name, "-c", cwd]
-    if cmd:
-        new_args.append(cmd)
+    if DEFAULT_TZ:
+        new_args.extend(["-e", f"TZ={DEFAULT_TZ}"])
     result = _tmux(*new_args)
     if result.returncode != 0:
         err_console.print(f"[red]tmux new-session failed: {result.stderr.strip()}[/red]")
         sys.exit(1)
+
+    if cmd:
+        _tmux("send-keys", "-t", name, cmd, "Enter")
 
     record = Workspace(
         name=name,
