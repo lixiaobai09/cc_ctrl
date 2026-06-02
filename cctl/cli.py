@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -35,6 +36,7 @@ class Workspace:
     cwd: str
     tmux_session: str
     created_at: str
+    session_id: str = ""
 
     @classmethod
     def from_dict(cls, d: dict) -> "Workspace":
@@ -94,14 +96,7 @@ def _touch_history(workspaces: list[Workspace]) -> None:
         h: dict[str, dict] = json.loads(raw) if raw else {}
         for w in workspaces:
             entry = h.get(w.name, {})
-            entry.update({
-                "name": w.name,
-                "comment": w.comment,
-                "cwd": w.cwd,
-                "tmux_session": w.tmux_session,
-                "created_at": w.created_at,
-                "last_seen": now,
-            })
+            entry.update({**asdict(w), "last_seen": now})
             h[w.name] = entry
         f.seek(0)
         f.truncate()
@@ -189,6 +184,7 @@ def create(name: str, comment: tuple[str, ...], cmd_override: str | None, cwd_ov
 
     cwd = str(Path(cwd_override).resolve()) if cwd_override else os.getcwd()
     cmd = DEFAULT_CMD if cmd_override is None else cmd_override
+    session_id = str(uuid.uuid4())
 
     # Start a bare shell, not the command itself. That way `/quit` (or whatever
     # exits cmd) leaves the user at a live shell prompt instead of tearing the
@@ -202,7 +198,8 @@ def create(name: str, comment: tuple[str, ...], cmd_override: str | None, cwd_ov
         sys.exit(1)
 
     if cmd:
-        _tmux("send-keys", "-t", name, cmd, "Enter")
+        launch = _inject_session_id(cmd, session_id)
+        _tmux("send-keys", "-t", name, launch, "Enter")
 
     record = Workspace(
         name=name,
@@ -210,6 +207,7 @@ def create(name: str, comment: tuple[str, ...], cmd_override: str | None, cwd_ov
         cwd=cwd,
         tmux_session=name,
         created_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        session_id=session_id,
     )
     with _locked_store(write=True) as items:
         items.append(record)
@@ -239,7 +237,6 @@ def list_cmd(as_json: bool) -> None:
     table.add_column("name", style="cyan")
     table.add_column("comment")
     table.add_column("cwd", style="dim")
-    table.add_column("session")
     table.add_column("created", style="dim")
     for i, w in enumerate(records, 1):
         table.add_row(
@@ -247,7 +244,6 @@ def list_cmd(as_json: bool) -> None:
             w.name,
             w.comment or "-",
             _shorten_path(w.cwd),
-            f"[green]{w.tmux_session}[/green]",
             _humanize_ts(w.created_at),
         )
     console.print(table)
@@ -315,6 +311,7 @@ def history(as_json: bool, limit: int, show_all: bool) -> None:
     table.add_column("name", style="cyan")
     table.add_column("comment")
     table.add_column("cwd", style="dim")
+    table.add_column("session id", style="dim")
     table.add_column("status")
     table.add_column("last seen", style="dim")
     for r in records:
@@ -324,10 +321,76 @@ def history(as_json: bool, limit: int, show_all: bool) -> None:
             r.get("name", ""),
             r.get("comment") or "-",
             _shorten_path(r.get("cwd", "")),
+            r.get("session_id") or "-",
             status,
             _humanize_ts(r.get("last_seen", "")),
         )
     console.print(table)
+
+
+@main.command(context_settings=CONTEXT_SETTINGS)
+@click.argument("name")
+@click.option("--as", "new_name", default=None, help="Restore under a different workspace name (default: same as history entry).")
+@click.option("--cwd", "cwd_override", default=None, type=click.Path(file_okay=False, dir_okay=True, exists=True), help="Override cwd (default: recorded cwd).")
+def restore(name: str, new_name: str | None, cwd_override: str | None) -> None:
+    """Restore a workspace from history via `claude --resume <session-id>`."""
+    _require_tmux()
+    h = _load_history()
+    entry = h.get(name)
+    if entry is None:
+        err_console.print(f"[red]no history entry named '{name}'[/red]")
+        sys.exit(1)
+    session_id = (entry.get("session_id") or "").strip()
+    if not session_id:
+        console.print(
+            f"[yellow]history entry '{name}' has no session_id (likely created before cctl tracked it).[/yellow]"
+        )
+        if not click.confirm(
+            f"fall back to `{DEFAULT_CMD} -c` (resume most recent claude session in the cwd)?",
+            default=False,
+        ):
+            err_console.print("[red]aborted.[/red]")
+            sys.exit(1)
+
+    target = new_name or name
+
+    with _locked_store() as items:
+        if _find_by_name(items, target):
+            err_console.print(f"[red]workspace '{target}' already exists. pass --as <other-name>.[/red]")
+            sys.exit(1)
+    if _session_exists(target):
+        err_console.print(f"[red]tmux session '{target}' already exists. pass --as <other-name>.[/red]")
+        sys.exit(1)
+
+    recorded_cwd = entry.get("cwd") or ""
+    cwd = str(Path(cwd_override).resolve()) if cwd_override else (recorded_cwd or os.getcwd())
+    if not Path(cwd).is_dir():
+        err_console.print(f"[red]cwd '{cwd}' does not exist. pass --cwd <path> to override.[/red]")
+        sys.exit(1)
+
+    new_args = ["new-session", "-d", "-s", target, "-c", cwd]
+    if DEFAULT_TZ:
+        new_args.extend(["-e", f"TZ={DEFAULT_TZ}"])
+    result = _tmux(*new_args)
+    if result.returncode != 0:
+        err_console.print(f"[red]tmux new-session failed: {result.stderr.strip()}[/red]")
+        sys.exit(1)
+
+    resume_cmd = f"{DEFAULT_CMD} --resume {session_id}" if session_id else f"{DEFAULT_CMD} -c"
+    _tmux("send-keys", "-t", target, resume_cmd, "Enter")
+
+    record = Workspace(
+        name=target,
+        comment=entry.get("comment", ""),
+        cwd=cwd,
+        tmux_session=target,
+        created_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        session_id=session_id,
+    )
+    with _locked_store(write=True) as items:
+        items.append(record)
+    _touch_history([record])
+    _switch_to(target)
 
 
 @main.command(context_settings=CONTEXT_SETTINGS)
@@ -372,6 +435,19 @@ def _pick_interactive(records: list[Workspace]) -> Workspace | None:
     if 1 <= choice <= len(records):
         return records[choice - 1]
     return None
+
+
+def _inject_session_id(cmd: str, session_id: str) -> str:
+    """Append `--session-id <uuid>` when cmd launches claude and doesn't already set it."""
+    tokens = cmd.split()
+    if not tokens:
+        return cmd
+    leaf = Path(tokens[0]).name
+    if leaf != "claude":
+        return cmd
+    if "--session-id" in tokens or "--resume" in tokens:
+        return cmd
+    return f"{cmd} --session-id {session_id}"
 
 
 def _shorten_path(p: str) -> str:

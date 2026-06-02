@@ -46,6 +46,8 @@ cctl create auth-refactor "split middleware per legal feedback"
 
 The session is started as a normal interactive shell with `claude` sent as a typed command on top — so when you `/quit` claude (or whatever you ran), you drop back to a live shell prompt instead of the tmux session dying. The session also has `TZ=Asia/Singapore` injected by default (configurable via `CCTL_TZ`).
 
+Each `create` mints a fresh UUID and launches claude as `claude --session-id <uuid>`, persisting that UUID in both `workspaces.json` and `history.json`. `cctl restore` later feeds the same UUID back to `claude --resume`. If `--cmd` already contains `--session-id` or `--resume`, or names a non-`claude` binary, the injection is skipped — your override wins.
+
 Options:
 
 - `--cwd PATH` — override the working directory.
@@ -56,12 +58,12 @@ Options:
 Show currently live workspaces in a table:
 
 ```
-┏━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
-┃ # ┃ name            ┃ comment              ┃ cwd                ┃ session         ┃ created ┃
-┡━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
-│ 1 │ auth-refactor   │ split middleware ... │ ~/code/api         │ auth-refactor   │ 12m ago │
-│ 2 │ flaky-tests     │ debug shard 4        │ ~/code/api         │ flaky-tests     │ 3m ago  │
-└───┴─────────────────┴──────────────────────┴────────────────────┴─────────────────┴─────────┘
+┏━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ # ┃ name            ┃ comment              ┃ cwd                ┃ created ┃
+┡━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
+│ 1 │ auth-refactor   │ split middleware ... │ ~/code/api         │ 12m ago │
+│ 2 │ flaky-tests     │ debug shard 4        │ ~/code/api         │ 3m ago  │
+└───┴─────────────────┴──────────────────────┴────────────────────┴─────────┘
 ```
 
 The `#` column is the short ID for `cctl go`. Output `--json` for scripting.
@@ -95,14 +97,23 @@ cctl history --all    # everything
 cctl history --json   # for scripts
 ```
 
-Each entry shows `name / comment / cwd / status (alive|gone) / last_seen`. Use it to recover after a reboot:
+Each entry shows `name / comment / cwd / session_id / status (alive|gone) / last_seen`. Use it (or `cctl restore` below) to recover after a reboot.
+
+### `cctl restore <name>`
+
+Recreates a workspace from a history entry, using the recorded `session_id` to call `claude --resume <uuid>` in the recorded cwd. This is the post-reboot equivalent of `cctl create`.
 
 ```bash
-$ cctl history
-# Find the workspace, note its cwd.
-$ cd /path/from/history
-$ claude --continue
+cctl restore auth-refactor                   # bring back exactly as before
+cctl restore auth-refactor --as auth-redo    # restore under a new name (e.g. live record still exists)
+cctl restore auth-refactor --cwd ~/code/api  # original cwd moved; resume from a different path
 ```
+
+Errors if a live workspace / tmux session with the target name already exists.
+
+If the history entry has no `session_id` (workspaces created by earlier versions of `cctl`), `restore` prompts to fall back to `claude -c` (resume the most recent claude session in the cwd) — confirm `y` to proceed, `n` to abort.
+
+If `claude --resume <uuid>` fails because the jsonl session file is gone (deleted, machine wiped), the tmux session is still created so you can manually `claude --continue` from there.
 
 ### `cctl completion <bash|zsh|fish>`
 
