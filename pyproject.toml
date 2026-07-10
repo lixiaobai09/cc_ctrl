@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cctl"
 version = "0.1.0"
-description = "Stash and resume Claude Code sessions with tmux integration"
+description = "Stash and resume coding-agent sessions with tmux integration"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.1",

@@ -3,9 +3,11 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -20,8 +22,18 @@ from rich.table import Table
 CCTL_DIR = Path(os.environ.get("CCTL_HOME", Path.home() / ".cctl"))
 STORE_FILE = CCTL_DIR / "workspaces.json"
 HISTORY_FILE = CCTL_DIR / "history.json"
-DEFAULT_CMD = os.environ.get("CCTL_DEFAULT_CMD", "claude")
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+CODEX_HOOKS_FILE = CODEX_HOME / "hooks.json"
+CODEX_HOOKS_LOCK_FILE = CODEX_HOME / "hooks.json.cctl.lock"
+DEFAULT_CMD = os.environ.get("CCTL_DEFAULT_CMD", "codex")
+CLAUDE_CMD = os.environ.get("CCTL_CLAUDE_CMD", "claude")
+QODER_CMD = os.environ.get("CCTL_QODER_CMD", "qodercli")
 DEFAULT_TZ = os.environ.get("CCTL_TZ", "Asia/Singapore")
+
+KNOWN_ENGINES = {"codex", "claude", "qodercli"}
+SESSION_ID_ENGINES = {"claude", "qodercli"}
+ENGINE_STYLES = {"codex": "green", "claude": "cyan", "qodercli": "magenta"}
+CODEX_HOOK_STATUS = "Recording Codex session in cctl"
 
 console = Console()
 err_console = Console(stderr=True)
@@ -37,6 +49,7 @@ class Workspace:
     tmux_session: str
     created_at: str
     session_id: str = ""
+    engine: str = ""
 
     @classmethod
     def from_dict(cls, d: dict) -> "Workspace":
@@ -104,6 +117,161 @@ def _touch_history(workspaces: list[Workspace]) -> None:
         f.write("\n")
 
 
+# ---------- Codex hook ----------
+
+@contextmanager
+def _locked_codex_hooks(write: bool = False) -> Iterator[dict]:
+    CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    with open(CODEX_HOOKS_LOCK_FILE, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if CODEX_HOOKS_FILE.exists():
+            try:
+                data = json.loads(CODEX_HOOKS_FILE.read_text() or "{}")
+            except json.JSONDecodeError as exc:
+                raise click.ClickException(f"cannot parse {CODEX_HOOKS_FILE}: {exc}") from exc
+        else:
+            data = {}
+        if not isinstance(data, dict):
+            raise click.ClickException(f"{CODEX_HOOKS_FILE} must contain a JSON object")
+
+        yield data
+        if write:
+            _write_json_atomic(CODEX_HOOKS_FILE, data)
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    # Keep dotfile-manager symlinks intact by atomically replacing their target.
+    write_path = path.resolve() if path.is_symlink() else path
+    write_path.parent.mkdir(parents=True, exist_ok=True)
+    old_mode = write_path.stat().st_mode & 0o777 if write_path.exists() else None
+    fd, temp_name = tempfile.mkstemp(prefix=f".{write_path.name}.", dir=write_path.parent, text=True)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        if old_mode is not None:
+            os.chmod(temp_name, old_mode)
+        os.replace(temp_name, write_path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _codex_capture_handler() -> dict:
+    cctl_binary = shutil.which("cctl")
+    if not cctl_binary:
+        raise click.ClickException("cctl is not in PATH; install the package before installing its Codex hook")
+    return {
+        "type": "command",
+        "command": f"{shlex.quote(cctl_binary)} codex-hook capture",
+        "timeout": 5,
+        "statusMessage": CODEX_HOOK_STATUS,
+    }
+
+
+def _is_cctl_capture_handler(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    command = value.get("command")
+    return (
+        value.get("type") == "command"
+        and value.get("statusMessage") == CODEX_HOOK_STATUS
+        and isinstance(command, str)
+        and command.endswith(" codex-hook capture")
+    )
+
+
+def _codex_hook_installed_in(data: dict) -> bool:
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    groups = hooks.get("SessionStart")
+    if not isinstance(groups, list):
+        return False
+    return any(
+        _is_cctl_capture_handler(handler)
+        for group in groups
+        if isinstance(group, dict) and isinstance(group.get("hooks"), list)
+        for handler in group["hooks"]
+    )
+
+
+def _remove_cctl_capture_handlers(data: dict) -> bool:
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    groups = hooks.get("SessionStart")
+    if not isinstance(groups, list):
+        return False
+
+    removed = False
+    kept_groups = []
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            kept_groups.append(group)
+            continue
+        handlers = group["hooks"]
+        kept_handlers = [handler for handler in handlers if not _is_cctl_capture_handler(handler)]
+        removed = removed or len(kept_handlers) != len(handlers)
+        if kept_handlers:
+            updated = dict(group)
+            updated["hooks"] = kept_handlers
+            kept_groups.append(updated)
+    if removed:
+        hooks["SessionStart"] = kept_groups
+    return removed
+
+
+def _codex_hook_installed() -> bool:
+    if not CODEX_HOOKS_FILE.exists():
+        return False
+    try:
+        data = json.loads(CODEX_HOOKS_FILE.read_text() or "{}")
+    except (json.JSONDecodeError, OSError):
+        return False
+    return isinstance(data, dict) and _codex_hook_installed_in(data)
+
+
+def _warn_if_codex_hook_missing() -> None:
+    if not _codex_hook_installed():
+        err_console.print(
+            "[yellow]warning: cctl's Codex SessionStart hook is not installed; "
+            "this session may only be restorable with `codex resume --last`. "
+            "Run `cctl codex-hook install`, then trust it in Codex `/hooks`.[/yellow]"
+        )
+
+
+def _capture_codex_session(payload: object, workspace_name: str) -> bool:
+    if not isinstance(payload, dict) or payload.get("hook_event_name") != "SessionStart":
+        return False
+    raw_session_id = payload.get("session_id")
+    hook_cwd = payload.get("cwd")
+    if not isinstance(raw_session_id, str) or not isinstance(hook_cwd, str):
+        return False
+    try:
+        session_id = str(uuid.UUID(raw_session_id))
+    except ValueError:
+        return False
+
+    updated: Workspace | None = None
+    with _locked_store(write=True) as items:
+        workspace = _find_by_name(items, workspace_name)
+        if workspace is None or workspace.engine != "codex":
+            return False
+        if os.path.realpath(workspace.cwd) != os.path.realpath(hook_cwd):
+            return False
+        if workspace.session_id == session_id:
+            return True
+        workspace.session_id = session_id
+        updated = workspace
+
+    if updated is not None:
+        _touch_history([updated])
+    return True
+
+
 # ---------- lookup ----------
 
 def _find_by_name(items: list[Workspace], name: str) -> Workspace | None:
@@ -161,17 +329,79 @@ def _session_exists(name: str) -> bool:
 @click.group(context_settings=CONTEXT_SETTINGS)
 @click.version_option()
 def main() -> None:
-    """Named tmux sessions with auto-launched Claude Code."""
+    """Named tmux sessions with auto-launched coding agents."""
+
+
+@main.group("codex-hook", context_settings=CONTEXT_SETTINGS)
+def codex_hook() -> None:
+    """Install and manage Codex session-ID capture."""
+
+
+@codex_hook.command("install", context_settings=CONTEXT_SETTINGS)
+def codex_hook_install() -> None:
+    """Install the user-level Codex SessionStart hook."""
+    handler = _codex_capture_handler()
+    with _locked_codex_hooks(write=True) as data:
+        hooks = data.setdefault("hooks", {})
+        if not isinstance(hooks, dict):
+            raise click.ClickException(f"the 'hooks' value in {CODEX_HOOKS_FILE} must be an object")
+        if not isinstance(hooks.setdefault("SessionStart", []), list):
+            raise click.ClickException(f"hooks.SessionStart in {CODEX_HOOKS_FILE} must be an array")
+        _remove_cctl_capture_handlers(data)
+        hooks["SessionStart"].append({"hooks": [handler]})
+
+    console.print(f"[green]installed cctl Codex hook in {CODEX_HOOKS_FILE}[/green]")
+    console.print("Open Codex, run [bold]/hooks[/bold], and trust the cctl hook once before using it.")
+
+
+@codex_hook.command("status", context_settings=CONTEXT_SETTINGS)
+def codex_hook_status() -> None:
+    """Check whether the cctl hook is configured."""
+    if _codex_hook_installed():
+        console.print(f"[green]installed[/green] in {CODEX_HOOKS_FILE}")
+        console.print("Trust state is managed by Codex; use [bold]/hooks[/bold] to inspect it.")
+        return
+    console.print(f"[yellow]not installed[/yellow] in {CODEX_HOOKS_FILE}")
+    raise click.exceptions.Exit(1)
+
+
+@codex_hook.command("uninstall", context_settings=CONTEXT_SETTINGS)
+def codex_hook_uninstall() -> None:
+    """Remove only cctl's Codex hook."""
+    with _locked_codex_hooks(write=True) as data:
+        removed = _remove_cctl_capture_handlers(data)
+    if removed:
+        console.print(f"[green]removed cctl Codex hook from {CODEX_HOOKS_FILE}[/green]")
+    else:
+        console.print(f"[dim]cctl Codex hook was not installed in {CODEX_HOOKS_FILE}[/dim]")
+
+
+@codex_hook.command("capture", hidden=True)
+def codex_hook_capture() -> None:
+    """Receive a Codex SessionStart event and update its cctl workspace."""
+    workspace_name = os.environ.get("CCTL_WORKSPACE", "")
+    if not workspace_name:
+        return
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return
+    _capture_codex_session(payload, workspace_name)
 
 
 @main.command(context_settings=CONTEXT_SETTINGS)
 @click.argument("name")
 @click.argument("comment", nargs=-1)
-@click.option("--cmd", "cmd_override", default=None, help=f"Command to run in the new session (default: {DEFAULT_CMD}). Use '' for none.")
+@click.option("-c", "--claude", "use_claude", is_flag=True, help=f"Launch `{CLAUDE_CMD}` instead of `{DEFAULT_CMD}`.")
+@click.option("-q", "--qoder", "use_qoder", is_flag=True, help=f"Launch `{QODER_CMD}` instead of `{DEFAULT_CMD}`.")
+@click.option("--cmd", "cmd_override", default=None, help=f"Full command override (default: {DEFAULT_CMD}; {CLAUDE_CMD} with -c; {QODER_CMD} with -q). Use '' for none.")
 @click.option("--cwd", "cwd_override", default=None, type=click.Path(file_okay=False, dir_okay=True, exists=True), help="Override cwd.")
-def create(name: str, comment: tuple[str, ...], cmd_override: str | None, cwd_override: str | None) -> None:
-    """Create a tmux session named NAME (auto-launches claude) and switch to it."""
+def create(name: str, comment: tuple[str, ...], use_claude: bool, use_qoder: bool, cmd_override: str | None, cwd_override: str | None) -> None:
+    """Create a tmux session named NAME (auto-launches codex) and switch to it."""
     _require_tmux()
+
+    if use_claude and use_qoder:
+        raise click.UsageError("-c/--claude and -q/--qoder are mutually exclusive")
 
     with _locked_store() as items:
         if _find_by_name(items, name):
@@ -183,8 +413,18 @@ def create(name: str, comment: tuple[str, ...], cmd_override: str | None, cwd_ov
         sys.exit(1)
 
     cwd = str(Path(cwd_override).resolve()) if cwd_override else os.getcwd()
-    cmd = DEFAULT_CMD if cmd_override is None else cmd_override
-    session_id = str(uuid.uuid4())
+    if cmd_override is not None:
+        cmd = cmd_override
+    elif use_claude:
+        cmd = CLAUDE_CMD
+    elif use_qoder:
+        cmd = QODER_CMD
+    else:
+        cmd = DEFAULT_CMD
+    engine = _detect_engine(cmd)
+    session_id = str(uuid.uuid4()) if engine in SESSION_ID_ENGINES else ""
+    if engine == "codex":
+        _warn_if_codex_hook_missing()
 
     # Start a bare shell, not the command itself. That way `/quit` (or whatever
     # exits cmd) leaves the user at a live shell prompt instead of tearing the
@@ -192,14 +432,12 @@ def create(name: str, comment: tuple[str, ...], cmd_override: str | None, cwd_ov
     new_args = ["new-session", "-d", "-s", name, "-c", cwd]
     if DEFAULT_TZ:
         new_args.extend(["-e", f"TZ={DEFAULT_TZ}"])
+    if engine == "codex":
+        new_args.extend(["-e", f"CCTL_WORKSPACE={name}", "-e", f"CCTL_HOME={CCTL_DIR.resolve()}"])
     result = _tmux(*new_args)
     if result.returncode != 0:
         err_console.print(f"[red]tmux new-session failed: {result.stderr.strip()}[/red]")
         sys.exit(1)
-
-    if cmd:
-        launch = _inject_session_id(cmd, session_id)
-        _tmux("send-keys", "-t", name, launch, "Enter")
 
     record = Workspace(
         name=name,
@@ -208,11 +446,18 @@ def create(name: str, comment: tuple[str, ...], cmd_override: str | None, cwd_ov
         tmux_session=name,
         created_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         session_id=session_id,
+        engine=engine,
     )
     with _locked_store(write=True) as items:
         items.append(record)
-
     _touch_history([record])
+
+    # Persist the record before launching Codex: SessionStart can fire as soon
+    # as the command starts and needs a workspace to update.
+    if cmd:
+        launch = _inject_session_id(cmd, session_id)
+        _tmux("send-keys", "-t", name, launch, "Enter")
+
     _switch_to(name)
 
 
@@ -235,6 +480,7 @@ def list_cmd(as_json: bool) -> None:
     table = Table(show_header=True, header_style="bold")
     table.add_column("#", style="bold yellow", justify="right")
     table.add_column("name", style="cyan")
+    table.add_column("engine")
     table.add_column("comment")
     table.add_column("cwd", style="dim")
     table.add_column("created", style="dim")
@@ -242,6 +488,7 @@ def list_cmd(as_json: bool) -> None:
         table.add_row(
             str(i),
             w.name,
+            _engine_cell(w.engine),
             w.comment or "-",
             _shorten_path(w.cwd),
             _humanize_ts(w.created_at),
@@ -309,6 +556,7 @@ def history(as_json: bool, limit: int, show_all: bool) -> None:
     alive = _live_sessions()
     table = Table(show_header=True, header_style="bold")
     table.add_column("name", style="cyan")
+    table.add_column("engine")
     table.add_column("comment")
     table.add_column("cwd", style="dim")
     table.add_column("session id", style="dim")
@@ -319,6 +567,7 @@ def history(as_json: bool, limit: int, show_all: bool) -> None:
         status = "[green]alive[/green]" if is_alive else "[dim]gone[/dim]"
         table.add_row(
             r.get("name", ""),
+            _engine_cell(r.get("engine") or ""),
             r.get("comment") or "-",
             _shorten_path(r.get("cwd", "")),
             r.get("session_id") or "-",
@@ -333,7 +582,7 @@ def history(as_json: bool, limit: int, show_all: bool) -> None:
 @click.option("--as", "new_name", default=None, help="Restore under a different workspace name (default: same as history entry).")
 @click.option("--cwd", "cwd_override", default=None, type=click.Path(file_okay=False, dir_okay=True, exists=True), help="Override cwd (default: recorded cwd).")
 def restore(name: str, new_name: str | None, cwd_override: str | None) -> None:
-    """Restore a workspace from history via `claude --resume <session-id>`."""
+    """Restore a workspace from history via its recorded coding agent."""
     _require_tmux()
     h = _load_history()
     entry = h.get(name)
@@ -341,12 +590,16 @@ def restore(name: str, new_name: str | None, cwd_override: str | None) -> None:
         err_console.print(f"[red]no history entry named '{name}'[/red]")
         sys.exit(1)
     session_id = (entry.get("session_id") or "").strip()
+    engine = (entry.get("engine") or "claude").strip()
+    binary = _engine_binary(engine)
+    if engine == "codex":
+        _warn_if_codex_hook_missing()
     if not session_id:
-        console.print(
-            f"[yellow]history entry '{name}' has no session_id (likely created before cctl tracked it).[/yellow]"
-        )
+        reason = "Codex assigns its own session IDs" if engine == "codex" else "the entry likely predates session tracking"
+        fallback_cmd = _resume_command(binary, engine, "")
+        console.print(f"[yellow]history entry '{name}' has no session_id ({reason}).[/yellow]")
         if not click.confirm(
-            f"fall back to `{DEFAULT_CMD} -c` (resume most recent claude session in the cwd)?",
+            f"fall back to `{fallback_cmd}` (resume the most recent {engine} session in the cwd)?",
             default=False,
         ):
             err_console.print("[red]aborted.[/red]")
@@ -371,13 +624,12 @@ def restore(name: str, new_name: str | None, cwd_override: str | None) -> None:
     new_args = ["new-session", "-d", "-s", target, "-c", cwd]
     if DEFAULT_TZ:
         new_args.extend(["-e", f"TZ={DEFAULT_TZ}"])
+    if engine == "codex":
+        new_args.extend(["-e", f"CCTL_WORKSPACE={target}", "-e", f"CCTL_HOME={CCTL_DIR.resolve()}"])
     result = _tmux(*new_args)
     if result.returncode != 0:
         err_console.print(f"[red]tmux new-session failed: {result.stderr.strip()}[/red]")
         sys.exit(1)
-
-    resume_cmd = f"{DEFAULT_CMD} --resume {session_id}" if session_id else f"{DEFAULT_CMD} -c"
-    _tmux("send-keys", "-t", target, resume_cmd, "Enter")
 
     record = Workspace(
         name=target,
@@ -386,10 +638,14 @@ def restore(name: str, new_name: str | None, cwd_override: str | None) -> None:
         tmux_session=target,
         created_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         session_id=session_id,
+        engine=engine,
     )
     with _locked_store(write=True) as items:
         items.append(record)
     _touch_history([record])
+
+    resume_cmd = _resume_command(binary, engine, session_id)
+    _tmux("send-keys", "-t", target, resume_cmd, "Enter")
     _switch_to(target)
 
 
@@ -437,17 +693,50 @@ def _pick_interactive(records: list[Workspace]) -> Workspace | None:
     return None
 
 
+def _detect_engine(cmd: str) -> str:
+    """Leaf name of cmd's first token, if it's a known engine; else ''."""
+    if not cmd:
+        return ""
+    leaf = Path(cmd.split()[0]).name
+    return leaf if leaf in KNOWN_ENGINES else ""
+
+
+def _engine_binary(engine: str) -> str:
+    """Map an engine marker back to the binary to invoke (honoring env overrides)."""
+    if engine == "codex":
+        return DEFAULT_CMD
+    if engine == "claude":
+        return CLAUDE_CMD
+    if engine == "qodercli":
+        return QODER_CMD
+    return DEFAULT_CMD
+
+
+def _resume_command(binary: str, engine: str, session_id: str) -> str:
+    """Build the engine-specific resume command."""
+    if engine == "codex":
+        return f"{binary} resume {session_id}" if session_id else f"{binary} resume --last"
+    return f"{binary} --resume {session_id}" if session_id else f"{binary} -c"
+
+
 def _inject_session_id(cmd: str, session_id: str) -> str:
-    """Append `--session-id <uuid>` when cmd launches claude and doesn't already set it."""
+    """Append `--session-id <uuid>` for engines that support caller-assigned IDs."""
     tokens = cmd.split()
     if not tokens:
         return cmd
     leaf = Path(tokens[0]).name
-    if leaf != "claude":
+    if leaf not in SESSION_ID_ENGINES:
         return cmd
     if "--session-id" in tokens or "--resume" in tokens:
         return cmd
     return f"{cmd} --session-id {session_id}"
+
+
+def _engine_cell(engine: str) -> str:
+    if not engine:
+        return "[dim]-[/dim]"
+    style = ENGINE_STYLES.get(engine, "white")
+    return f"[{style}]{engine}[/{style}]"
 
 
 def _shorten_path(p: str) -> str:
