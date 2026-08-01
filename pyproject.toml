@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "cctl"
 version = "0.1.0"
 description = "Stash and resume coding-agent sessions with tmux integration"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "click>=8.1",
     "rich>=13.0",
