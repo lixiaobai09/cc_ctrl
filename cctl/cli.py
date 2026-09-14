@@ -243,6 +243,23 @@ def _warn_if_codex_hook_missing() -> None:
         )
 
 
+def _log_codex_capture(workspace_name: str, session_id: str, reason: str, old_session_id: str = "") -> None:
+    """Best-effort diagnostics without recording prompts or transcript contents."""
+    try:
+        CCTL_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CCTL_DIR / "codex-capture.jsonl", "a") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(json.dumps({
+                "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "workspace": workspace_name,
+                "session_id": session_id,
+                "old_session_id": old_session_id,
+                "reason": reason,
+            }) + "\n")
+    except OSError:
+        pass
+
+
 def _capture_codex_session(payload: object, workspace_name: str) -> bool:
     if not isinstance(payload, dict) or payload.get("hook_event_name") != "SessionStart":
         return False
@@ -255,20 +272,29 @@ def _capture_codex_session(payload: object, workspace_name: str) -> bool:
     except ValueError:
         return False
 
-    updated: Workspace | None = None
+    # Internal ephemeral sessions (for example title generation) can inherit
+    # CCTL_WORKSPACE and emit SessionStart too. They have no transcript path.
+    # Check the hook field, not file existence: a new session's transcript may
+    # not have been flushed yet. Do not infer an ID from the newest cwd file.
+    transcript_path = payload.get("transcript_path")
+    if not isinstance(transcript_path, str) or not transcript_path.strip():
+        _log_codex_capture(workspace_name, session_id, "ignored_missing_transcript")
+        return False
+
     with _locked_store(write=True) as items:
         workspace = _find_by_name(items, workspace_name)
         if workspace is None or workspace.engine != "codex":
+            _log_codex_capture(workspace_name, session_id, "ignored_workspace")
             return False
         if os.path.realpath(workspace.cwd) != os.path.realpath(hook_cwd):
+            _log_codex_capture(workspace_name, session_id, "ignored_cwd")
             return False
-        if workspace.session_id == session_id:
-            return True
+        old_session_id = workspace.session_id
         workspace.session_id = session_id
-        updated = workspace
-
-    if updated is not None:
-        _touch_history([updated])
+        # Keep concurrent hook updates in the same order in both stores, and
+        # repair history even when the workspace already contains this ID.
+        _touch_history([workspace])
+        _log_codex_capture(workspace_name, session_id, "recorded", old_session_id)
     return True
 
 

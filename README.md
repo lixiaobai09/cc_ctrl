@@ -47,6 +47,15 @@ In Codex, run `/hooks` and trust the cctl hook. After that, every Codex workspac
 
 Use `cctl codex-hook status` to check whether the hook is configured, or `cctl codex-hook uninstall` to remove only cctl's handler. Codex owns the trust state, so inspect `/hooks` if the hook is installed but a session ID remains empty.
 
+Capture requires a non-empty `transcript_path` in the hook event. This prevents
+ephemeral Codex threads, such as background title generation, from overwriting
+the workspace's session ID. The transcript need not exist on disk yet at startup.
+Normal startup, resume, clear, and compact events can still update the ID.
+Capture decisions are logged to `$CCTL_HOME/codex-capture.jsonl` (default:
+`~/.cctl/codex-capture.jsonl`), including the workspace, incoming ID, reason, and
+previous ID for accepted events. Prompts and transcript contents are not logged.
+`codex-hook status` checks installation only, not the validity of recorded IDs.
+
 ## Commands
 
 ### `cctl create <name> [comment...]`
