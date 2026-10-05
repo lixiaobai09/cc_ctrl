@@ -449,6 +449,7 @@ def create(name: str, comment: tuple[str, ...], use_claude: bool, use_qoder: boo
         cmd = DEFAULT_CMD
     engine = _detect_engine(cmd)
     session_id = str(uuid.uuid4()) if engine in SESSION_ID_ENGINES else ""
+    launch = _isolate_codex_command(_inject_session_id(cmd, session_id))
     if engine == "codex":
         _warn_if_codex_hook_missing()
 
@@ -481,7 +482,6 @@ def create(name: str, comment: tuple[str, ...], use_claude: bool, use_qoder: boo
     # Persist the record before launching Codex: SessionStart can fire as soon
     # as the command starts and needs a workspace to update.
     if cmd:
-        launch = _inject_session_id(cmd, session_id)
         _tmux("send-keys", "-t", name, launch, "Enter")
 
     _switch_to(name)
@@ -618,11 +618,12 @@ def restore(name: str, new_name: str | None, cwd_override: str | None) -> None:
     session_id = (entry.get("session_id") or "").strip()
     engine = (entry.get("engine") or "claude").strip()
     binary = _engine_binary(engine)
+    resume_cmd = _isolate_codex_command(_resume_command(binary, engine, session_id))
     if engine == "codex":
         _warn_if_codex_hook_missing()
     if not session_id:
         reason = "Codex assigns its own session IDs" if engine == "codex" else "the entry likely predates session tracking"
-        fallback_cmd = _resume_command(binary, engine, "")
+        fallback_cmd = resume_cmd
         console.print(f"[yellow]history entry '{name}' has no session_id ({reason}).[/yellow]")
         if not click.confirm(
             f"fall back to `{fallback_cmd}` (resume the most recent {engine} session in the cwd)?",
@@ -670,7 +671,6 @@ def restore(name: str, new_name: str | None, cwd_override: str | None) -> None:
         items.append(record)
     _touch_history([record])
 
-    resume_cmd = _resume_command(binary, engine, session_id)
     _tmux("send-keys", "-t", target, resume_cmd, "Enter")
     _switch_to(target)
 
@@ -756,6 +756,24 @@ def _inject_session_id(cmd: str, session_id: str) -> str:
     if "--session-id" in tokens or "--resume" in tokens:
         return cmd
     return f"{cmd} --session-id {session_id}"
+
+
+def _isolate_codex_command(cmd: str) -> str:
+    """Keep workspace-scoped hook environment out of the shared daemon.
+
+    Insert before arguments (including `--` or a prompt), preserving their
+    original shell quoting. This follows the same executable detection as create.
+    """
+    if _detect_engine(cmd) != "codex":
+        return cmd
+    tokens = shlex.split(cmd)
+    options = tokens[1:tokens.index("--")] if "--" in tokens else tokens[1:]
+    if "--remote" in options or any(t.startswith("--remote=") for t in options):
+        raise click.ClickException("cctl Codex workspaces require a local process; --remote cannot preserve workspace hook identity")
+    if "--no-daemon" in options:
+        return cmd
+    parts = cmd.split(maxsplit=1)
+    return f"{parts[0]} --no-daemon" + (f" {parts[1]}" if len(parts) > 1 else "")
 
 
 def _engine_cell(engine: str) -> str:

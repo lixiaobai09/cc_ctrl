@@ -68,6 +68,18 @@ cctl create auth-refactor "split middleware per legal feedback"
 
 The session is started as a normal interactive shell with `codex` sent as a typed command on top — so when you exit Codex (or whatever you ran), you drop back to a live shell prompt instead of the tmux session dying. The session also has `TZ=Asia/Singapore` injected by default (configurable via `CCTL_TZ`).
 
+cctl adds `--no-daemon` to Codex commands on create and restore. This requires
+a Codex CLI that supports that option (verified with 0.160.0). Hooks must run in
+the workspace's own process environment: a shared daemon can retain another
+workspace's `CCTL_WORKSPACE`, causing missing IDs or incorrect updates when two
+workspaces use the same directory. Explicit `--remote` commands are rejected.
+When manually launching or forking Codex in a cctl shell, also pass
+`--no-daemon`, for example `codex fork --no-daemon <session-id>`.
+Already-running Codex processes must be exited and resumed with this option;
+editing cctl does not change their environment. Fork ID tracking still depends
+on Codex emitting a qualifying `SessionStart` event; a fork without that event
+will not update the recorded ID automatically.
+
 Claude and qodercli sessions get a fresh UUID via `--session-id`. Codex assigns its UUID internally and the installed `SessionStart` hook writes it back to cctl. All three engines therefore restore the exact recorded session. If the hook is missing or not yet trusted, cctl warns but still starts Codex; that record remains pending until a later hook event captures the ID.
 
 If `--cmd` already contains `--session-id` or `--resume`, or names another binary, Claude/qoder ID injection is skipped — your override wins.
