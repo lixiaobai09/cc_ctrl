@@ -31,6 +31,7 @@ class WebTests(unittest.TestCase):
             self.stack.enter_context(patch.object(cli, key, value))
         self.stack.enter_context(patch.object(manager, 'sessions', return_value={}))
         self.auth = Auth(self.root)
+        self.stack.callback(self.auth.close)
         self.auth.configure('admin', 'a-long-test-password')
         self.client = self.stack.enter_context(TestClient(create_app('https://cct.test', self.auth), base_url='https://cct.test'))
         self.headers = {'Origin': 'https://cct.test'}
@@ -113,7 +114,7 @@ class TmuxTests(unittest.TestCase):
         entry={'name':'test','comment':'','cwd':str(self.root),'tmux_session':'test','created_at':'now','engine':'codex','session_id':str(uuid.uuid4())}
         storage.atomic(cli.STORE_FILE,[entry]);storage.atomic(cli.HISTORY_FILE,{'test':entry})
         manager.migrate();self.row=manager.snapshot()[0]
-        self.auth=Auth(self.root);self.auth.configure('admin','a-long-test-password')
+        self.auth=Auth(self.root);self.stack.callback(self.auth.close);self.auth.configure('admin','a-long-test-password')
 
     def client(self):
         client=self.stack.enter_context(TestClient(create_app('https://cct.test',self.auth),base_url='https://cct.test'))

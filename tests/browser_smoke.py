@@ -68,7 +68,7 @@ try:
     wait("(() => {const screen=document.querySelector('.xterm-screen').getBoundingClientRect();const viewport=document.querySelector('.xterm-viewport');return viewport.getBoundingClientRect().right-screen.right>=Math.max(6,viewport.offsetWidth-viewport.clientWidth)-0.5;})()")
     assert js("document.getElementById('input')===null")
     row=js("(() => {const keys=document.getElementById('keys');const buttons=[...keys.querySelectorAll('button')];return {count:buttons.length,top:buttons.map(b=>b.getBoundingClientRect().top),fits:keys.scrollWidth<=keys.clientWidth+1};})()")
-    assert row['count']==9 and max(row['top'])-min(row['top'])<1 and row['fits'],row
+    assert row['count']==10 and max(row['top'])-min(row['top'])<1 and row['fits'],row
     js("window._testClipboard='cct mobile terminal · ready';Object.defineProperty(navigator.clipboard,'readText',{configurable:true,value:async()=>window._testClipboard})")
     js("(async()=>{document.getElementById('paste').click();await new Promise(r=>setTimeout(r,50));document.getElementById('enter').click();})()")
     time.sleep(.2)
@@ -87,8 +87,46 @@ try:
     assert 0<=geometry['rightGutter']<=10,geometry
     assert js("document.querySelector('.terminal-scroll').hidden")
     assert js("document.getElementById('font-value').value")=='8px'
+    # Opening the editor and the OS keyboard must not resize the tmux surface.
+    old_size=subprocess.check_output(['tmux','-S',sock,'display-message','-p','-t','browser-test:0','#{window_width},#{window_height}'],text=True).strip()
+    old_frame=js("document.querySelector('.terminal-frame').getBoundingClientRect().height")
+    js("document.getElementById('editor-open').click()")
+    wait("!!document.getElementById('editor-text') && document.activeElement.id==='editor-text'")
+    cdp('Emulation.setDeviceMetricsOverride',{'width':390,'height':440,'deviceScaleFactor':1,'mobile':True})
+    time.sleep(.7)
+    assert subprocess.check_output(['tmux','-S',sock,'display-message','-p','-t','browser-test:0','#{window_width},#{window_height}'],text=True).strip()==old_size
+    assert abs(js("document.querySelector('.terminal-frame').getBoundingClientRect().height")-old_frame)<1
+    assert js("document.querySelector('.editor-card').getBoundingClientRect().bottom")<=440
+    editor_shot=cdp('Page.captureScreenshot',{'format':'png','captureBeyondViewport':False})
+    (root/'editor.png').write_bytes(base64.b64decode(editor_shot['data']))
+    js("document.getElementById('editor-text').value='EDITOR_LINE_ONE\\nSECRET_EDITOR_CONTENT';document.getElementById('editor-text').setSelectionRange(7,11);document.getElementById('editor-text').setRangeText('EDITED')")
+    editor_text=js("document.getElementById('editor-text').value")
+    assert 'EDITED' in editor_text
+    js("document.getElementById('editor-cancel').click()")
+    cdp('Emulation.setDeviceMetricsOverride',{'width':390,'height':844,'deviceScaleFactor':1,'mobile':True})
+    time.sleep(.6)
+    js("document.getElementById('editor-open').click()")
+    assert js("document.getElementById('editor-text').value")==editor_text
+    js("document.getElementById('editor-send').click()")
+    wait("document.querySelector('.floating-editor').hidden")
+    time.sleep(.3)
+    text=subprocess.check_output(['tmux','-S',sock,'capture-pane','-p','-t','browser-test:0'],text=True)
+    assert 'EDITOR_EDITED_ONE' in text and text.count('SECRET_EDITOR_CONTENT')>=2,text
+    assert 'SECRET_EDITOR_CONTENT' not in (root/'server/security.jsonl').read_text()
+    time.sleep(.6)
+    # A light touch opens the editor; scrolling gestures later must not open it.
+    touch=js("(() => {const r=document.querySelector('.terminal-frame').getBoundingClientRect();return {x:r.left+80,y:r.top+80};})()")
+    cdp('Input.dispatchTouchEvent',{'type':'touchStart','touchPoints':[{'x':touch['x'],'y':touch['y'],'id':1}]})
+    cdp('Input.dispatchTouchEvent',{'type':'touchEnd','touchPoints':[]})
+    wait("!document.querySelector('.floating-editor').hidden")
+    assert js("document.getElementById('editor-text').value")==''
+    js("document.getElementById('editor-cancel').click()")
+    time.sleep(.6)
     original_cols=int(subprocess.check_output(['tmux','-S',sock,'display-message','-p','-t','browser-test:0','#{window_width}'],text=True))
-    js("document.querySelector('.terminal-menu summary').click();document.getElementById('font-larger').click()")
+    js("document.querySelector('.terminal-menu summary').click();document.getElementById('font-smaller').click();document.getElementById('font-smaller').click()")
+    wait("document.getElementById('font-value').value==='6px'")
+    assert js("document.getElementById('font-smaller').disabled")
+    js("document.getElementById('font-reset').click();document.getElementById('font-larger').click()")
     wait("document.getElementById('font-value').value==='9px'")
     for _ in range(100):
         actual_cols=int(subprocess.check_output(['tmux','-S',sock,'display-message','-p','-t','browser-test:0','#{window_width}'],text=True))
@@ -141,7 +179,7 @@ try:
     js("document.querySelector('.terminal-menu summary').click();document.getElementById('font-reset').click()")
     wait("document.getElementById('font-value').value==='8px'")
     assert not errors,errors
-    print(json.dumps({'result':'PASS: HTTPS login, mobile render, window selection, adaptation, native terminal typing, clipboard paste, one-row shortcuts, font preferences, direct touch history scrolling with adapted scrollbar hidden','screenshot':str(root/'mobile.png'),'terminal_notice':js("document.getElementById('notice').textContent"),'geometry':geometry},ensure_ascii=False))
+    print(json.dumps({'result':'PASS: HTTPS login, mobile render, window selection, adaptation, native typing, floating editor/keyboard-size freeze/drafts, clipboard paste, one-row shortcuts, font preferences, direct touch history scrolling with adapted scrollbar hidden','screenshot':str(root/'mobile.png'),'editor_screenshot':str(root/'editor.png'),'terminal_notice':js("document.getElementById('notice').textContent"),'geometry':geometry},ensure_ascii=False))
     ws.close()
 finally:
     connections.close()

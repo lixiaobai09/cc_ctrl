@@ -282,6 +282,9 @@ address including the port; another hostname or HTTP access is rejected. Without
 `--host` the service only listens on `127.0.0.1`. There is no anonymous/HTTP mode.
 The phone and host must have network connectivity, and the host must stay awake.
 Stop with Ctrl-C: attached web clients disconnect while agents remain in tmux.
+The server explicitly enables ECDHE with AES-GCM/ChaCha20 for modern browser
+compatibility, including ECDSA certificates on Python 3.9 with LibreSSL. These
+suites require TLS 1.2 or newer; TLS 1.3 availability depends on Python's SSL library.
 
 ### Terminal behavior
 
@@ -289,7 +292,7 @@ Stop with Ctrl-C: attached web clients disconnect while agents remain in tmux.
   connection notes are in the menu. All bottom shortcuts share one row, without
   a separate draft input. Scrollbars have reserved space outside terminal text.
 - Default terminal font size is 8px. Use Menu → terminal font size to decrease,
-  increase or reset it (8–20px). The browser remembers the choice. When mobile
+  increase or reset it (6–20px). The browser remembers the choice. When mobile
   adaptation is active, changing font size recalculates the shared window geometry.
 - Swipe vertically over the terminal to scroll the active pane. Before adaptation,
   a narrow scroll control is also available on the right; after adaptation it is
@@ -305,10 +308,18 @@ Stop with Ctrl-C: attached web clients disconnect while agents remain in tmux.
 - One browser controls each workspace run; others can watch or explicitly take
   control. Local tmux clients can still type/switch at any time.
 - Tap the terminal prompt to type using the native terminal input. Bottom shortcuts
-  (Esc, Tab, arrows, Ctrl-C, Paste, Enter) occupy one row. Paste reads the browser
+  (Esc, Tab, arrows, Ctrl-C, Input, Paste, Enter) occupy one row. Paste reads the browser
   clipboard on click and transfers text without Enter; if clipboard access is
   denied, long-press the terminal input to use the browser's paste action. Enter
   sends a terminal carriage return. Input is never resent after a disconnect.
+- On mobile, lightly tap the terminal or use **输入** to open a floating multiline
+  editor above the system keyboard. The terminal layout and tmux dimensions stay
+  fixed while editing; fitting resumes after the keyboard dismisses. Enter inserts
+  a newline, Ctrl/Command+Enter or **发送** pastes the whole text and sends Enter.
+  Cancel keeps a draft in browser memory per workspace/run/pane until logout or
+  page reload. If control, connection or target changes, the draft is kept instead
+  of sending it blindly. Gestures continue to scroll rather than opening the editor.
+  The system keyboard itself is positioned by the OS, not by the page.
 - Default sizing preserves the existing terminal view and allows scrolling. Click
   **适配手机** to size the current window to the phone; this also changes that
   window on the desktop. Rotation/keyboard changes update the size while enabled.
@@ -371,3 +382,43 @@ certificate, and validates login, mobile rendering, sizing, window selection and
 PTY input. It prints a screenshot path. On Linux set `CCT_CHROME` to the Chrome or
 Chromium binary. TLS verification bypass is confined to this synthetic test browser;
 normal deployment requires a certificate trusted by the phone.
+
+### Login load protection and security audit
+
+Password validation uses a dedicated bounded executor. By default at most **two**
+login jobs run concurrently; admission happens before queueing or hashing. Extra
+requests immediately return HTTP `429` with `Retry-After: 1`. Jobs retain their
+slot until completion, including failure backoff, even if the HTTP client disconnects.
+The existing per-IP/global login rate limits remain in effect.
+
+Use `--login-concurrency N` on `cct serve` to select 1–8 concurrent jobs. The default
+of 2 bounds simultaneous Argon2 password verification memory to approximately
+128MiB (other server memory is additional). This does not impose a WebSocket count
+limit or a network allowlist.
+
+Security events are written to `$CCTL_HOME/server/security.jsonl` (normally
+`~/.cctl/server/security.jsonl`): login success/failure, rate/concurrency rejection,
+logout/revocation, local account reset, rejected HTTP/WebSocket requests, connection
+open/close and abnormal connection/control failures, plus service start/stop. Fields include UTC timestamp,
+peer IP, fixed reason codes and non-bearer session/connection IDs when known.
+Passwords, attempted usernames, Cookie/token values, CSRF secrets, User-Agent,
+request/query contents and terminal input/output are never included in this audit.
+
+```bash
+cct server audit --limit 50   # JSON, newest first, including rotated files
+# Or inspect the active file directly:
+tail -f ~/.cctl/server/security.jsonl
+```
+
+The file and its lock/backups have user-only permissions (`600`), under the private
+server directory (`700`). Files rotate at 5MiB with three backups (roughly 20MiB
+maximum). Noncritical bursts beyond 20 events/second are summarized with an
+`audit_suppressed` count; successful login, logout/revocation and administrator
+changes are retained individually. A pending suppression summary is flushed on
+the next event or graceful shutdown. File-write failures produce a stderr warning
+without bypassing authentication. Socket/TLS handshake failures before ASGI are
+outside this application audit and remain the server/network layer's responsibility.
+The peer IP comes from the socket, not an untrusted forwarded header.
+
+Restart an already-running service to activate backend security changes. Account,
+certificate, terminal and network settings are preserved.

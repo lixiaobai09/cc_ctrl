@@ -14,7 +14,11 @@ let resizeTimer:number|undefined, fit:FitAddon|null=null, statusRows=1;
 let frameObserver:ResizeObserver|null=null;
 let autoFitEnabled=false;
 let remoteScrollSupported=false;
-const DEFAULT_FONT_SIZE=8, MIN_FONT_SIZE=8, MAX_FONT_SIZE=20;
+const DEFAULT_FONT_SIZE=8, MIN_FONT_SIZE=6, MAX_FONT_SIZE=20;
+let editorOpen=false,editorFreeze=false,editorSending=false;
+let editorReleaseTimer:number|undefined,editorElement:HTMLElement|null=null;
+let editorTarget:{key:string;window:string;pane:string;connection:WebSocket|null}|null=null;
+const editorDrafts=new Map<string,string>();
 function savedFontSize(){
   try{const value=Number(localStorage.getItem('cct.terminal.fontSize'));return Number.isInteger(value)&&value>=MIN_FONT_SIZE&&value<=MAX_FONT_SIZE?value:DEFAULT_FONT_SIZE;}
   catch{return DEFAULT_FONT_SIZE;}
@@ -36,6 +40,9 @@ function button(text:string, action:()=>void, className=''):HTMLButtonElement {
   const b=document.createElement('button');b.textContent=text;b.className=className;b.addEventListener('click',action);return b;
 }
 function clean(){
+  rememberEditorDraft();window.clearTimeout(editorReleaseTimer);
+  editorElement?.remove();editorElement=null;editorTarget=null;editorOpen=false;editorFreeze=false;editorSending=false;
+  document.body.classList.remove('editor-open');root.style.transform='';
   generation++; window.clearTimeout(reconnectTimer);window.clearInterval(pollTimer);window.clearTimeout(resizeTimer);
   frameObserver?.disconnect();frameObserver=null;
   if(ws){ws.onclose=null;ws.close();ws=null;} term?.dispose();term=null;fit=null;
@@ -46,7 +53,7 @@ function shell(content:string){
   root.innerHTML=`<header><a class="brand" href="/">cct<span>REMOTE WORKSPACE</span></a><nav id="nav"></nav></header><p id="notice" role="status" aria-live="polite"></p>${content}`;
 }
 function showLogin(){
-  clean();csrf='';remoteScrollSupported=false;
+  clean();csrf='';remoteScrollSupported=false;editorDrafts.clear();
   shell(`<section class="login card"><div class="eyebrow">你的工作，继续进行</div><h1>连接工作区</h1><p class="muted">登录这台主机，查看进度或接着操作。</p><form id="login"><label>管理员账号<input id="username" name="username" autocomplete="username" required maxlength="100"></label><label>密码<input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024"></label><label class="check"><input id="remember" type="checkbox">记住登录，最多 30 天</label><button type="submit" class="primary">登录 →</button></form></section>`);
   get<HTMLFormElement>('login').onsubmit=async event=>{
     event.preventDefault();const b=get<HTMLFormElement>('login').querySelector('button')!;b.disabled=true;
@@ -111,8 +118,9 @@ async function showSessions(){
 }
 function send(message:unknown){if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify(message));}
 function controls(){
-  for(const id of ['window','pane','adapt','restore-size'])get<HTMLButtonElement>(id).disabled=!writer;
-  root.querySelectorAll<HTMLButtonElement>('.keys button').forEach(button=>button.disabled=!writer);
+  for(const id of ['window','pane','adapt','restore-size'])get<HTMLButtonElement>(id).disabled=!writer||editorOpen;
+  root.querySelectorAll<HTMLButtonElement>('.keys button').forEach(button=>button.disabled=!writer||editorOpen);
+  if(editorElement){get<HTMLButtonElement>('editor-send').disabled=!writer||ws?.readyState!==WebSocket.OPEN;}
   get<HTMLButtonElement>('claim').textContent=writer?'释放':'接管';
   get<HTMLButtonElement>('claim').title=writer?'释放终端控制权':'接管终端控制权';
   get<HTMLElement>('mode').textContent=writer?'你正在控制':'旁观模式';
@@ -140,8 +148,77 @@ async function pasteClipboard(){
     const target=windows.find(w=>w.active),activePane=target?.panes.find(p=>p.active);
     if(current!==generation)return;
     if(!writer||ws!==connection||ws?.readyState!==WebSocket.OPEN||target?.id!==active?.id||activePane?.id!==pane?.id){notice('终端状态已变化，请重新粘贴。');return;}
-    term?.paste(text);term?.focus();notice('');
+    term?.paste(text);if(matchMedia('(pointer:fine)').matches)term?.focus();notice('');
   }catch{if(current===generation)notice('浏览器无法读取剪贴板，请长按终端输入区使用粘贴。');}
+}
+function rememberEditorDraft(){
+  if(editorElement&&editorTarget&&editorOpen){editorDrafts.set(editorTarget.key,get<HTMLTextAreaElement>('editor-text').value);}
+}
+function editorViewport(){
+  if(!editorFreeze||!editorElement)return;
+  const viewport=window.visualViewport,visible=viewport?.height||window.innerHeight,offset=viewport?.offsetTop||0;
+  const bottom=Math.max(0,window.innerHeight-visible-offset)+8;
+  const card=editorElement.querySelector<HTMLElement>('.editor-card')!;
+  card.style.bottom=`${bottom}px`;card.style.maxHeight=`${Math.max(80,visible-16)}px`;
+  get<HTMLTextAreaElement>('editor-text').style.maxHeight=`${Math.max(48,Math.min(240,visible-140))}px`;
+  root.style.transform=offset?`translateY(${offset}px)`:'';
+}
+function releaseEditorFreeze(){
+  editorFreeze=false;root.style.transform='';document.body.classList.remove('editor-open');resize();
+}
+function closeEditor(){
+  if(!editorOpen)return;
+  rememberEditorDraft();editorOpen=false;get<HTMLTextAreaElement>('editor-text').blur();
+  editorElement!.hidden=true;controls();
+  // Wait for the keyboard dismissal/visual viewport animation to settle before fitting.
+  window.clearTimeout(editorReleaseTimer);editorReleaseTimer=window.setTimeout(releaseEditorFreeze,500);
+}
+function sendEditor(){
+  if(!writer||!term||ws?.readyState!==WebSocket.OPEN){get<HTMLElement>('editor-message').textContent='请先接管并连接终端。草稿已保留。';return;}
+  const active=windows.find(w=>w.active),pane=active?.panes.find(p=>p.active);
+  if(!editorTarget||ws!==editorTarget.connection||active?.id!==editorTarget.window||pane?.id!==editorTarget.pane){
+    get<HTMLElement>('editor-message').textContent='连接、窗口或面板已变化。草稿已保留，请关闭后重新打开输入。';return;
+  }
+  const input=get<HTMLTextAreaElement>('editor-text');
+  if(!input.value){get<HTMLElement>('editor-message').textContent='请输入要发送的内容。';return;}
+  editorSending=true;
+  try{term!.paste(input.value);send({type:'input',data:'\r'});}
+  finally{editorSending=false;}
+  input.value='';editorDrafts.delete(editorTarget.key);closeEditor();
+}
+function openEditor(){
+  if(editorOpen||!terminalReady())return;
+  const active=windows.find(w=>w.active),pane=active?.panes.find(p=>p.active);
+  if(!selected||!active||!pane)return;
+  window.clearTimeout(editorReleaseTimer);window.clearTimeout(resizeTimer);
+  editorTarget={key:`${selected.workspace_id}:${selected.run_id}:${pane.id}`,window:active.id,pane:pane.id,connection:ws};
+  if(!editorElement){
+    editorElement=document.createElement('div');editorElement.className='floating-editor';editorElement.hidden=true;
+    editorElement.innerHTML=`<section class="editor-card" role="dialog" aria-modal="true" aria-labelledby="editor-title"><header><div><h2 id="editor-title">编辑并发送</h2><p id="editor-context"></p></div><button id="editor-close" aria-label="关闭输入框">×</button></header><textarea id="editor-text" rows="5" placeholder="在这里编辑完整内容…" aria-label="完整提示词" autocapitalize="off" spellcheck="false"></textarea><p id="editor-message" role="status" aria-live="polite"></p><footer><span>Enter 换行 · Ctrl/⌘+Enter 发送</span><button id="editor-cancel">取消</button><button id="editor-send" class="primary">发送 ↵</button></footer></section>`;
+    document.body.append(editorElement);
+    get<HTMLButtonElement>('editor-close').onclick=closeEditor;get<HTMLButtonElement>('editor-cancel').onclick=closeEditor;get<HTMLButtonElement>('editor-send').onclick=sendEditor;
+    editorElement.onclick=event=>{if(event.target===editorElement)closeEditor();};
+    editorElement.onkeydown=event=>{
+      if(event.isComposing||event.keyCode===229)return;
+      if(event.key==='Escape'){event.preventDefault();closeEditor();}
+      if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();sendEditor();}
+      if(event.key==='Tab'){
+        const items=Array.from(editorElement!.querySelectorAll<HTMLElement>('button:not(:disabled),textarea')),first=items[0],last=items[items.length-1];
+        if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}
+        else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}
+      }
+    };
+  }
+  editorOpen=true;editorFreeze=true;document.body.classList.add('editor-open');editorElement.hidden=false;
+  get<HTMLElement>('editor-context').textContent=`${selected.name} · ${active.index}:${pane.index} · ${pane.command}`;
+  const input=get<HTMLTextAreaElement>('editor-text');input.value=editorDrafts.get(editorTarget.key)||'';
+  get<HTMLElement>('editor-message').textContent='';editorViewport();controls();
+  term?.blur();input.focus({preventScroll:true});input.setSelectionRange(input.value.length,input.value.length);
+}
+function editorTap(){
+  get<HTMLElement>('terminal').addEventListener('pointerdown',event=>{
+    if(event.pointerType==='touch'&&!editorOpen){event.preventDefault();event.stopImmediatePropagation();}
+  },{capture:true});
 }
 function reserveScrollbar(){
   const viewport=term?.element?.querySelector<HTMLElement>('.xterm-viewport');
@@ -168,20 +245,27 @@ function scrolling(){
   const frame=root.querySelector<HTMLElement>('.terminal-frame')!;
   get<HTMLButtonElement>('scroll-up').onclick=()=>scrollTerminal(-5);
   get<HTMLButtonElement>('scroll-down').onclick=()=>scrollTerminal(5);
-  let startX=0,lastY=0,vertical=false;
+  let startX=0,startY=0,lastY=0,vertical=false,tapTime=0,tapMoved=false,tapEligible=false;
   frame.addEventListener('touchstart',event=>{
     if(event.touches.length!==1)return;
-    startX=event.touches[0].clientX;lastY=event.touches[0].clientY;vertical=false;
+    startX=event.touches[0].clientX;startY=lastY=event.touches[0].clientY;vertical=false;tapMoved=false;tapTime=performance.now();
+    tapEligible=get<HTMLElement>('terminal').contains(event.target as Node);
   },{passive:true,capture:true});
   frame.addEventListener('touchmove',event=>{
     if(event.touches.length!==1)return;
     const touch=event.touches[0],dy=lastY-touch.clientY;
+    if(Math.hypot(touch.clientX-startX,touch.clientY-startY)>8)tapMoved=true;
     if(!vertical&&Math.abs(touch.clientX-startX)>Math.abs(dy))return;
     const lineHeight=Math.max(8,fontSize*1.2);
     if(Math.abs(dy)<lineHeight)return;
     vertical=true;event.preventDefault();event.stopImmediatePropagation();
     const lines=Math.trunc(dy/lineHeight);lastY-=lines*lineHeight;scrollTerminal(lines);
   },{passive:false,capture:true});
+  frame.addEventListener('touchend',event=>{
+    if(tapEligible&&!tapMoved&&event.touches.length===0&&performance.now()-tapTime<500){event.preventDefault();event.stopImmediatePropagation();openEditor();}
+    tapEligible=false;
+  },{passive:false,capture:true});
+  frame.addEventListener('touchcancel',()=>{tapEligible=false;},{passive:true,capture:true});
   frame.addEventListener('wheel',event=>{
     if(Math.abs(event.deltaX)>Math.abs(event.deltaY))return;
     if(!event.deltaY)return;
@@ -234,6 +318,11 @@ function measurement(){
   return {cols:Math.max(10,Math.min(500,cols)),rows:Math.max(5,Math.min(300,dims.rows))};
 }
 function resize(){
+  if(editorFreeze){
+    editorViewport();
+    if(!editorOpen){window.clearTimeout(editorReleaseTimer);editorReleaseTimer=window.setTimeout(releaseEditorFreeze,500);}
+    return;
+  }
   document.documentElement.style.setProperty('--viewport',`${window.visualViewport?.height||window.innerHeight}px`);
   window.clearTimeout(resizeTimer);resizeTimer=window.setTimeout(()=>{
     if(autoFitEnabled&&adapted&&writer){const size=measurement();if(size)send({type:'adapt',window:windows.find(w=>w.active)?.id,...size});}
@@ -248,12 +337,12 @@ function openTerminal(row:Workspace){
   get<HTMLButtonElement>('back').onclick=()=>void showWorkspaces();
   term=new Terminal({fontFamily:'Menlo, Consolas, monospace',fontSize,cursorBlink:true,scrollback:3000,theme:{background:'#0b1117',foreground:'#d8e3ea',cursor:'#7ee0b5'},allowProposedApi:false});
   fit=new FitAddon();term.loadAddon(fit);term.open(get<HTMLElement>('terminal'));
-  fontControls();scrolling();
+  fontControls();scrolling();editorTap();
   get<HTMLButtonElement>('font-smaller').onclick=()=>setFontSize(fontSize-1);
   get<HTMLButtonElement>('font-larger').onclick=()=>setFontSize(fontSize+1);
   get<HTMLButtonElement>('font-reset').onclick=()=>setFontSize(DEFAULT_FONT_SIZE);
   frameObserver=new ResizeObserver(()=>resize());frameObserver.observe(root.querySelector('.terminal-frame')!);
-  term.onData(data=>{if(writer){const chunks=Array.from(data);let chunk='';let bytes=0;for(const char of chunks){const count=new TextEncoder().encode(char).length;if(bytes+count>12000){send({type:'input',data:chunk});chunk='';bytes=0;}chunk+=char;bytes+=count;}if(chunk)send({type:'input',data:chunk});}});
+  term.onData(data=>{if(writer&&(!editorOpen||editorSending)){const chunks=Array.from(data);let chunk='';let bytes=0;for(const char of chunks){const count=new TextEncoder().encode(char).length;if(bytes+count>12000){send({type:'input',data:chunk});chunk='';bytes=0;}chunk+=char;bytes+=count;}if(chunk)send({type:'input',data:chunk});}});
   const stopAutoFit=()=>{autoFitEnabled=false;window.clearTimeout(resizeTimer);};
   get<HTMLSelectElement>('window').onchange=()=>{stopAutoFit();send({type:'select-window',id:get<HTMLSelectElement>('window').value});};
   get<HTMLSelectElement>('pane').onchange=()=>{stopAutoFit();send({type:'select-pane',id:get<HTMLSelectElement>('pane').value});};
@@ -265,7 +354,8 @@ function openTerminal(row:Workspace){
   }
   const paste=button('粘贴',()=>void pasteClipboard());paste.id='paste';paste.title='粘贴剪贴板文字到终端，不发送回车';
   const enter=button('Enter ↵',()=>{if(terminalReady())send({type:'input',data:'\r'});},'primary');enter.id='enter';enter.title='向终端发送回车';
-  get<HTMLElement>('keys').append(paste,enter);
+  const input=button('输入',openEditor);input.id='editor-open';input.title='浮层编辑完整文本并发送';
+  get<HTMLElement>('keys').append(input,paste,enter);
   function connect(reconnect=false){
     if(current!==generation)return;
     ws=new WebSocket(`${location.origin.replace(/^https/,'wss')}/api/workspaces/${row.workspace_id}/terminal?run_id=${encodeURIComponent(row.run_id)}${reconnect?'&reconnect=1':''}`);ws.binaryType='arraybuffer';
@@ -290,5 +380,5 @@ function openTerminal(row:Workspace){
   }
   controls();resize();connect();
 }
-window.addEventListener('resize',resize);window.visualViewport?.addEventListener('resize',resize);
+window.addEventListener('resize',resize);window.visualViewport?.addEventListener('resize',resize);window.visualViewport?.addEventListener('scroll',()=>{if(editorFreeze)resize();});
 void start();

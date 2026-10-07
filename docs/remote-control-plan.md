@@ -32,3 +32,11 @@ socket and temporary state, not live user workspaces. Ship built static files.
 Compatibility: Python 3.9+ for CLI and web. Python-version dependency markers
 select 3.9-compatible server releases; newer interpreters keep their newer ranges.
 Browser smoke test uses the WebSocket context manager shared by these versions.
+
+Current input UX: default terminal font 8px, adjustable 6–20px. Bottom shortcuts
+stay on one row. A mobile tap or Input button opens a body-level floating editor;
+keyboard viewport changes do not resize the tmux window while editing. Full text
+is pasted and submitted on Send; cancelled drafts stay in memory per run/pane.
+Security additions: default 2 admitted verification jobs with cancellation-safe
+ownership and dedicated executor; bounded, credential-free JSONL audit logs with
+rotation, burst summaries and local CLI inspection.

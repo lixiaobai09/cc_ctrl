@@ -222,6 +222,7 @@ class Client:
         self.send_lock = asyncio.Lock()
         self.closed = False
         self.last_state = None
+        self.close_reason = 'normal'
         self.hub.clients.add(self)
 
     @classmethod
@@ -244,12 +245,15 @@ class Client:
     async def output(self):
         while True:
             data = await self.pty.queue.get()
-            if data is None: return
+            if data is None:
+                self.close_reason = 'pty_closed'
+                return
             await self.send(data)
 
     async def authenticate(self):
         while True:
             if not await asyncio.to_thread(self.hub.auth.session, self.token):
+                self.close_reason = 'session_invalidated'
                 await self.ws.close(code=4401)
                 return
             await asyncio.sleep(1)
