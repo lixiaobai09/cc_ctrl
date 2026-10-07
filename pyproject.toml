@@ -12,6 +12,19 @@ dependencies = [
     "rich>=13.0",
 ]
 
+[project.optional-dependencies]
+web = [
+    "starlette>=0.40,<0.50; python_version < '3.10'",
+    "starlette>=0.40,<1; python_version >= '3.10'",
+    "uvicorn>=0.30,<0.40; python_version < '3.10'",
+    "uvicorn>=0.30,<1; python_version >= '3.10'",
+    "websockets>=13,<16; python_version < '3.10'",
+    "websockets>=13; python_version >= '3.10'",
+    "anyio>=4.4,<4.13; python_version < '3.10'",
+    "argon2-cffi>=23",
+]
+test = ["httpx>=0.27", "build", "hatchling"]
+
 [project.scripts]
 cctl = "cctl.cli:main"
 cct = "cctl.cli:main"

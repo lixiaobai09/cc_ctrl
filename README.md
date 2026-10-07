@@ -13,7 +13,7 @@ When you run multiple coding-agent sessions, each typically lives in its own tmu
 
 ## Install
 
-Requires Python 3.10+ and tmux.
+Requires Python 3.9+ and tmux.
 
 ```bash
 pipx install -e /path/to/cc_ctl
@@ -195,3 +195,179 @@ The Codex hook location follows `CODEX_HOME` (default: `~/.codex`).
 - `cctl history` records on every `create` and on every `list`. Each entry is keyed by name, so re-creating a workspace with the same name overwrites the prior record's fields (keeping the history compact). If you want full historical timestamps per recreation, file an issue.
 - If you only want to look but not nudge `last_seen`, use `cctl peek` instead of `cctl list`.
 - Running Codex `/new` inside a cctl workspace updates that workspace to the new session UUID, so a later `restore` follows the session most recently active in that tmux workspace.
+
+## Mobile web terminal (optional)
+
+The web server is opt-in. It supports existing workspace attach, exact history
+restore, window/pane selection, and manual mobile sizing. It does not create new
+workspaces from the browser. Run it as the same OS user as your tmux sessions.
+
+Python 3.9 is supported for both the CLI and web server. Its web dependencies
+use compatible release ranges (Starlette <0.50, Uvicorn <0.40, websockets <16,
+AnyIO <4.13); newer Python environments can use newer releases. Python 3.9.6
+was verified with Starlette 0.49.3, Uvicorn 0.39.0, websockets 15.0.1 and
+AnyIO 4.12.1, including the HTTPS browser smoke test.
+
+Install with Python 3.9+:
+
+```bash
+python3 -m pip install -e '.[web]'
+cct server init
+```
+
+If you already installed an older cct, reinstall it using Python 3.9+ and update
+its Codex hook with the **same installation**:
+
+```bash
+cct codex-hook install
+```
+
+Trust the updated handler in Codex `/hooks`. Mixing an old hook executable with
+new workspace records can discard the new identity fields. The updated hook uses
+the installing Python interpreter rather than looking up another cct on PATH.
+
+`init` prompts for an administrator username and a password of at least 12
+characters. Passwords use Argon2id; each browser gets a separate revocable login.
+Account setup does not start a network listener. CLI commands keep working without
+web dependencies.
+
+### HTTPS on a home/studio network
+
+Use a stable LAN hostname or reserved IP. Obtain a certificate whose SAN includes
+that hostname/IP and install the issuing CA certificate as trusted on the phone.
+An existing trusted certificate also works. For a private LAN CA, OpenSSL example:
+
+```bash
+mkdir -p ~/.cctl/tls
+chmod 700 ~/.cctl/tls
+openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
+  -keyout ~/.cctl/tls/ca.key -out ~/.cctl/tls/ca.crt \
+  -subj '/CN=cct LAN CA' \
+  -addext 'basicConstraints=critical,CA:TRUE' \
+  -addext 'keyUsage=critical,keyCertSign,cRLSign'
+openssl req -newkey rsa:3072 -nodes \
+  -keyout ~/.cctl/tls/server.key -out ~/.cctl/tls/server.csr \
+  -subj '/CN=cct.home.arpa'
+cat > ~/.cctl/tls/server.ext <<'EOF'
+subjectAltName=DNS:cct.home.arpa,IP:192.168.1.50
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+EOF
+openssl x509 -req -in ~/.cctl/tls/server.csr \
+  -CA ~/.cctl/tls/ca.crt -CAkey ~/.cctl/tls/ca.key -CAcreateserial \
+  -out ~/.cctl/tls/server.crt -days 365 -extfile ~/.cctl/tls/server.ext
+chmod 600 ~/.cctl/tls/*.key
+```
+
+Replace the example hostname/IP with your machine's actual address, and configure
+local DNS if using the hostname. Keep the CA private key on the computer; transfer
+only `ca.crt` to the phone. On iOS install the CA profile and enable full trust in
+Settings → General → About → Certificate Trust Settings. On Android install the CA
+as a user CA in the device's certificate/security settings; verify it is trusted
+by your chosen browser. OpenSSL 3 supports the commands above; on macOS you can
+use Homebrew's `openssl` if the system command lacks `-addext`.
+
+Start the foreground service:
+
+```bash
+cct serve --host 0.0.0.0 --port 8443 \
+  --cert-file ~/.cctl/tls/server.crt \
+  --key-file ~/.cctl/tls/server.key \
+  --origin https://192.168.1.50:8443
+```
+
+Open exactly that HTTPS address on the phone. `--origin` must match the browser's
+address including the port; another hostname or HTTP access is rejected. Without
+`--host` the service only listens on `127.0.0.1`. There is no anonymous/HTTP mode.
+The phone and host must have network connectivity, and the host must stay awake.
+Stop with Ctrl-C: attached web clients disconnect while agents remain in tmux.
+
+### Terminal behavior
+
+- The terminal view uses a compact header and toolbar; login management and
+  connection notes are in the menu. All bottom shortcuts share one row, without
+  a separate draft input. Scrollbars have reserved space outside terminal text.
+- Default terminal font size is 8px. Use Menu → terminal font size to decrease,
+  increase or reset it (8–20px). The browser remembers the choice. When mobile
+  adaptation is active, changing font size recalculates the shared window geometry.
+- Swipe vertically over the terminal to scroll the active pane. Before adaptation,
+  a narrow scroll control is also available on the right; after adaptation it is
+  hidden so the terminal can use the full width. Arrow buttons and desktop wheel also work.
+  This requires web control when scrolling the remote pane: mouse-aware apps such
+  as Codex receive wheel events; shells use tmux copy-mode history. Scrolling down
+  to the end exits tmux copy-mode. The rail controls scrolling, not the app's exact
+  transcript position. No global tmux mouse settings are changed.
+- First open selects the lowest-index window, whether numbering starts at 0 or 1.
+  Reconnecting follows the current window without resetting focus.
+- The entire selected window, including splits, is rendered. Input goes to its
+  active pane. Window/pane selection is shared with local tmux clients.
+- One browser controls each workspace run; others can watch or explicitly take
+  control. Local tmux clients can still type/switch at any time.
+- Tap the terminal prompt to type using the native terminal input. Bottom shortcuts
+  (Esc, Tab, arrows, Ctrl-C, Paste, Enter) occupy one row. Paste reads the browser
+  clipboard on click and transfers text without Enter; if clipboard access is
+  denied, long-press the terminal input to use the browser's paste action. Enter
+  sends a terminal carriage return. Input is never resent after a disconnect.
+- Default sizing preserves the existing terminal view and allows scrolling. Click
+  **适配手机** to size the current window to the phone; this also changes that
+  window on the desktop. Rotation/keyboard changes update the size while enabled.
+- Release, takeover, window change, disconnect or shutdown restores the previous
+  size policy. Manual sizing restores original dimensions; inherited options remain
+  inherited. Crash recovery runs on next server startup. Independent user changes
+  are preserved. Small split layouts may require scrolling and pane proportions
+  may change when resized; no automatic pane zoom is performed.
+- History restore requires an exact saved UUID and an existing directory. Missing
+  IDs/paths or name collisions must be handled with local `cct restore`. Restoring
+  does not recreate additional windows or split layouts.
+
+### Login management
+
+```bash
+cct server sessions list
+cct server sessions revoke LOGIN_ID
+cct server sessions revoke --all
+cct server reset-password
+```
+
+Ordinary logins use a browser-session cookie with a 12-hour server lifetime;
+“remember login” lasts up to 30 days. Closing a browser is not a reliable logout;
+use the logout button. Password reset revokes all logins. Revocation closes active
+terminal connections within five seconds. All logged-in browsers have administrator
+access to the host user's terminals. Credentials, sessions and size recovery are in
+`$CCTL_HOME/server/auth.sqlite3`, protected by user-only permissions.
+
+Existing JSON records gain stable workspace/run IDs on first server startup, with
+`*.pre-web.bak` backups. Web queries do not update history timestamps or remove
+records on tmux errors. New agent launches also send workspace/run IDs to hooks;
+existing processes retain legacy tracking until relaunched. The earlier Codex fork
+hook limitation still applies.
+
+### Development and verification
+
+```bash
+python3 -m pip install -e '.[web,test]'
+cd web
+npm ci
+npm run build
+cd ..
+python3 -m unittest discover -s tests -v
+python3 -m build
+```
+
+The frontend build writes committed assets to `cctl/static`. Build it before
+packaging after frontend changes. Published wheels include those files and do not
+need Node.js at runtime. Tests use temporary state and an isolated tmux socket.
+The implementation contract is in [docs/remote-control-plan.md](docs/remote-control-plan.md).
+
+Optional browser smoke test (Chrome and OpenSSL required):
+
+```bash
+PYTHONPATH=. python3 tests/browser_smoke.py
+```
+
+It launches a temporary HTTPS server and isolated headless browser, uses a temporary
+certificate, and validates login, mobile rendering, sizing, window selection and
+PTY input. It prints a screenshot path. On Linux set `CCT_CHROME` to the Chrome or
+Chromium binary. TLS verification bypass is confined to this synthetic test browser;
+normal deployment requires a certificate trusted by the phone.

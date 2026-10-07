@@ -71,6 +71,12 @@ class WorkspaceIdentityTests(unittest.TestCase):
         self.tmux.assert_not_called()
         self.assertFalse(cli.HISTORY_FILE.exists())
 
+    def test_hook_uses_current_python_instead_of_other_installation_on_path(self):
+        with patch.object(cli.shutil, 'which', return_value='/old/cctl'):
+            command = cli._codex_capture_handler()['command']
+        self.assertIn('-m cctl.cli codex-hook capture', command)
+        self.assertNotIn('/old/cctl', command)
+
     def test_other_engines_unchanged(self):
         for cmd in ('claude --resume abc', 'qodercli', '', 'bash'):
             self.assertEqual(cli._isolate_codex_command(cmd), cmd)

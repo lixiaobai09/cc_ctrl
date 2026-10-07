@@ -19,6 +19,8 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from . import storage
+
 CCTL_DIR = Path(os.environ.get("CCTL_HOME", Path.home() / ".cctl"))
 STORE_FILE = CCTL_DIR / "workspaces.json"
 HISTORY_FILE = CCTL_DIR / "history.json"
@@ -50,6 +52,10 @@ class Workspace:
     created_at: str
     session_id: str = ""
     engine: str = ""
+    workspace_id: str = ""
+    run_id: str = ""
+    tmux_id: str = ""
+    tmux_created: str = ""
 
     @classmethod
     def from_dict(cls, d: dict) -> "Workspace":
@@ -61,60 +67,36 @@ class Workspace:
 @contextmanager
 def _locked_store(write: bool = False) -> Iterator[list[Workspace]]:
     CCTL_DIR.mkdir(parents=True, exist_ok=True)
-    mode = "r+" if STORE_FILE.exists() else "w+"
-    with open(STORE_FILE, mode) as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        f.seek(0)
-        raw = f.read().strip()
-        data = json.loads(raw) if raw else []
-        items = [Workspace.from_dict(d) for d in data]
-
+    with storage.locked(STORE_FILE):
+        items = [Workspace.from_dict(d) for d in storage.read(STORE_FILE, [])]
         pruned = False
         if items:
             alive = _live_sessions()
             kept = [w for w in items if w.tmux_session in alive]
-            if len(kept) != len(items):
-                items = kept
-                pruned = True
-
+            pruned = len(kept) != len(items)
+            items = kept
         yield items
         if write or pruned:
-            f.seek(0)
-            f.truncate()
-            json.dump([asdict(w) for w in items], f, indent=2, ensure_ascii=False)
-            f.write("\n")
+            storage.atomic(STORE_FILE, [asdict(w) for w in items])
 
 
 # ---------- history ----------
 
 def _load_history() -> dict[str, dict]:
-    if not HISTORY_FILE.exists():
-        return {}
-    try:
-        return json.loads(HISTORY_FILE.read_text() or "{}")
-    except json.JSONDecodeError:
-        return {}
+    with storage.locked(HISTORY_FILE):
+        return storage.read(HISTORY_FILE, {})
 
 
 def _touch_history(workspaces: list[Workspace]) -> None:
-    """Upsert history entries for each given workspace. Never deletes."""
     if not workspaces:
         return
-    CCTL_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-    with open(HISTORY_FILE, "a+") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        f.seek(0)
-        raw = f.read().strip()
-        h: dict[str, dict] = json.loads(raw) if raw else {}
-        for w in workspaces:
-            entry = h.get(w.name, {})
-            entry.update({**asdict(w), "last_seen": now})
-            h[w.name] = entry
-        f.seek(0)
-        f.truncate()
-        json.dump(h, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    with storage.locked(HISTORY_FILE):
+        history = storage.read(HISTORY_FILE, {})
+        for workspace in workspaces:
+            history[workspace.name] = {**history.get(workspace.name, {}),
+                **asdict(workspace), "last_seen": now}
+        storage.atomic(HISTORY_FILE, history)
 
 
 # ---------- Codex hook ----------
@@ -160,12 +142,11 @@ def _write_json_atomic(path: Path, data: dict) -> None:
 
 
 def _codex_capture_handler() -> dict:
-    cctl_binary = shutil.which("cctl")
-    if not cctl_binary:
-        raise click.ClickException("cctl is not in PATH; install the package before installing its Codex hook")
+    # Bind hooks to this installation, not another cctl earlier on PATH.
+    capture_command = f"{shlex.quote(sys.executable)} -m cctl.cli codex-hook capture"
     return {
         "type": "command",
-        "command": f"{shlex.quote(cctl_binary)} codex-hook capture",
+        "command": capture_command,
         "timeout": 5,
         "statusMessage": CODEX_HOOK_STATUS,
     }
@@ -260,7 +241,7 @@ def _log_codex_capture(workspace_name: str, session_id: str, reason: str, old_se
         pass
 
 
-def _capture_codex_session(payload: object, workspace_name: str) -> bool:
+def _capture_codex_session(payload: object, workspace_name: str, workspace_id: str = "", run_id: str = "") -> bool:
     if not isinstance(payload, dict) or payload.get("hook_event_name") != "SessionStart":
         return False
     raw_session_id = payload.get("session_id")
@@ -285,6 +266,9 @@ def _capture_codex_session(payload: object, workspace_name: str) -> bool:
         workspace = _find_by_name(items, workspace_name)
         if workspace is None or workspace.engine != "codex":
             _log_codex_capture(workspace_name, session_id, "ignored_workspace")
+            return False
+        if (workspace_id and workspace_id != workspace.workspace_id) or (run_id and run_id != workspace.run_id):
+            _log_codex_capture(workspace_name, session_id, "ignored_run")
             return False
         if os.path.realpath(workspace.cwd) != os.path.realpath(hook_cwd):
             _log_codex_capture(workspace_name, session_id, "ignored_cwd")
@@ -329,7 +313,9 @@ def _in_tmux() -> bool:
 
 
 def _tmux(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+    socket = os.environ.get("CCTL_TMUX_SOCKET")
+    prefix = ["tmux", "-S", socket] if socket else ["tmux"]
+    return subprocess.run([*prefix, *args], capture_output=True, text=True, timeout=10)
 
 
 def _tmux_out(*args: str) -> str:
@@ -342,7 +328,9 @@ def _live_sessions() -> set[str]:
         return set()
     ls = _tmux("list-sessions", "-F", "#{session_name}")
     if ls.returncode != 0:
-        return set()
+        if "no server running" in ls.stderr or "No such file or directory" in ls.stderr or "Connection refused" in ls.stderr:
+            return set()
+        raise click.ClickException("tmux query failed: " + ls.stderr.strip())
     return set(ls.stdout.splitlines())
 
 
@@ -412,7 +400,7 @@ def codex_hook_capture() -> None:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, OSError):
         return
-    _capture_codex_session(payload, workspace_name)
+    _capture_codex_session(payload, workspace_name, os.environ.get("CCTL_WORKSPACE_ID", ""), os.environ.get("CCTL_RUN_ID", ""))
 
 
 @main.command(context_settings=CONTEXT_SETTINGS)
@@ -453,36 +441,13 @@ def create(name: str, comment: tuple[str, ...], use_claude: bool, use_qoder: boo
     if engine == "codex":
         _warn_if_codex_hook_missing()
 
-    # Start a bare shell, not the command itself. That way `/quit` (or whatever
-    # exits cmd) leaves the user at a live shell prompt instead of tearing the
-    # tmux session down with cmd's exit.
-    new_args = ["new-session", "-d", "-s", name, "-c", cwd]
-    if DEFAULT_TZ:
-        new_args.extend(["-e", f"TZ={DEFAULT_TZ}"])
-    if engine == "codex":
-        new_args.extend(["-e", f"CCTL_WORKSPACE={name}", "-e", f"CCTL_HOME={CCTL_DIR.resolve()}"])
-    result = _tmux(*new_args)
-    if result.returncode != 0:
-        err_console.print(f"[red]tmux new-session failed: {result.stderr.strip()}[/red]")
-        sys.exit(1)
-
+    from .manager import start_workspace
     record = Workspace(
-        name=name,
-        comment=" ".join(comment),
-        cwd=cwd,
-        tmux_session=name,
+        name=name, comment=" ".join(comment), cwd=cwd, tmux_session=name,
         created_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-        session_id=session_id,
-        engine=engine,
+        session_id=session_id, engine=engine, workspace_id=str(uuid.uuid4()), run_id=str(uuid.uuid4()),
     )
-    with _locked_store(write=True) as items:
-        items.append(record)
-    _touch_history([record])
-
-    # Persist the record before launching Codex: SessionStart can fire as soon
-    # as the command starts and needs a workspace to update.
-    if cmd:
-        _tmux("send-keys", "-t", name, launch, "Enter")
+    start_workspace(record, launch)
 
     _switch_to(name)
 
@@ -632,46 +597,9 @@ def restore(name: str, new_name: str | None, cwd_override: str | None) -> None:
             err_console.print("[red]aborted.[/red]")
             sys.exit(1)
 
-    target = new_name or name
-
-    with _locked_store() as items:
-        if _find_by_name(items, target):
-            err_console.print(f"[red]workspace '{target}' already exists. pass --as <other-name>.[/red]")
-            sys.exit(1)
-    if _session_exists(target):
-        err_console.print(f"[red]tmux session '{target}' already exists. pass --as <other-name>.[/red]")
-        sys.exit(1)
-
-    recorded_cwd = entry.get("cwd") or ""
-    cwd = str(Path(cwd_override).resolve()) if cwd_override else (recorded_cwd or os.getcwd())
-    if not Path(cwd).is_dir():
-        err_console.print(f"[red]cwd '{cwd}' does not exist. pass --cwd <path> to override.[/red]")
-        sys.exit(1)
-
-    new_args = ["new-session", "-d", "-s", target, "-c", cwd]
-    if DEFAULT_TZ:
-        new_args.extend(["-e", f"TZ={DEFAULT_TZ}"])
-    if engine == "codex":
-        new_args.extend(["-e", f"CCTL_WORKSPACE={target}", "-e", f"CCTL_HOME={CCTL_DIR.resolve()}"])
-    result = _tmux(*new_args)
-    if result.returncode != 0:
-        err_console.print(f"[red]tmux new-session failed: {result.stderr.strip()}[/red]")
-        sys.exit(1)
-
-    record = Workspace(
-        name=target,
-        comment=entry.get("comment", ""),
-        cwd=cwd,
-        tmux_session=target,
-        created_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-        session_id=session_id,
-        engine=engine,
-    )
-    with _locked_store(write=True) as items:
-        items.append(record)
-    _touch_history([record])
-
-    _tmux("send-keys", "-t", target, resume_cmd, "Enter")
+    from .manager import restore_workspace
+    record = restore_workspace(name, new_name, cwd_override, allow_missing=True)
+    target = record.tmux_session
     _switch_to(target)
 
 
@@ -802,6 +730,11 @@ def _humanize_ts(iso: str) -> str:
     if secs < 86400:
         return f"{secs // 3600}h ago"
     return f"{secs // 86400}d ago"
+
+
+from .server_cli import server, serve
+main.add_command(server)
+main.add_command(serve)
 
 
 if __name__ == "__main__":
